@@ -11,7 +11,10 @@ import numpy as np
 
 # --- import your classes ---
 from dataset import CAMUS_loader
-from Unet import UNet
+# from Unet import UNet
+# from Attention_Unet import UNet
+from Trans_Unet import TransUNetLite
+import torch.nn.functional as F
 
 # --------- visualization palette (edit colors if you like) ----------
 PALETTE = {
@@ -216,21 +219,37 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=4, shuffle=True,  num_workers=4, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size=4, shuffle=False, num_workers=4, pin_memory=True)
 
-    # --- model, loss, optim, sched ---
-    model = UNet().to(device)          # make sure UNet.out_channels = 4, input channels match dataset
-    criterion = nn.CrossEntropyLoss()  # target: [B,H,W] long
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    # This code is for U-Net, Attention U-Net, 
+    # ##--- model, loss, optim, sched ---
+    # model = UNet().to(device)          ### make sure UNet.out_channels = 4, input channels match dataset
+    # criterion = nn.CrossEntropyLoss()  # ###target: [B,H,W] long
+    # optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
-    results_dir = ensure_dir("results")
+    # This code is for TransUNet
+    model = TransUNetLite(
+    in_channels=1,      # CAMUS is grayscale
+    num_classes=4,      # adjust to your labels
+    img_size=224        # ensure your dataset outputs this size
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()      # targets: [B,H,W] int64 in [0..C-1]
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    # Optional: gradient clipping for stability
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+
+    results_dir = ensure_dir("Transf_Unet_results") # where metrics + CMs go
     metrics_csv = os.path.join(results_dir, "metrics.csv")
-    save_root   = "qualitative"  # where images go
+    save_root   = "qualitative_Transf_Unet"  # where images go
     
 
     best_mdice = 0.0
     patience, bad = 20, 0
 
-    save_root = "qualitative"  # all epoch-wise visuals go here
+    save_root = "qualitative_Transf_Unet"  # all epoch-wise visuals go here
 
     for epoch in range(60):
         tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
