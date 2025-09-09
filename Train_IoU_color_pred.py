@@ -233,7 +233,8 @@ def main():
     img_size=224        # ensure your dataset outputs this size
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss()      # targets: [B,H,W] int64 in [0..C-1]
+    criterion = nn.CrossEntropyLoss()     ## targets: [B,H,W] int64 in [0..C-1]
+
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
     # optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
