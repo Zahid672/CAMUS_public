@@ -12,8 +12,8 @@ import csv
 # --- import your classes ---
 from dataset import CAMUS_loader
 # from Unet import UNet
-from Attention_Unet import UNet
-# from Trans_Unet import TransUNetLite  # if you want the transformer version
+# from Attention_Unet import UNet
+from Trans_Unet import TransUNetLite  # if you want the transformer version
 
 # --------- visualization palette (edit colors if you like) ----------
 PALETTE = {
@@ -261,7 +261,12 @@ def main():
     test_loader  = DataLoader(test_ds,  batch_size=4, shuffle=False, num_workers=4, pin_memory=True)
 
     # -------- model, loss, optim, sched --------
-    model = UNet().to(device)  # ensure UNet.in/out channels match (grayscale->1 in, 4 out)
+    # model = UNet().to(device)  # ensure UNet.in/out channels match (grayscale->1 in, 4 out)
+    model = TransUNetLite(
+    in_channels=1,      # CAMUS is grayscale
+    num_classes=4,      # adjust to your labels
+    img_size=224        # ensure your dataset outputs this size
+    ).to(device)
 
     # Optional per-class alpha weights to counter class imbalance (order: ids 0..C-1)
     alpha = None
@@ -274,9 +279,9 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
-    results_dir = ensure_dir("Attention_Unet_results_FocalLoss")  # where metrics + CMs go
-    metrics_csv = os.path.join(results_dir, "Attention_Unet_metrics_FocalLoss.csv")
-    save_root   = "qualitative_Attention_Unet_FocalLoss"         # where images go
+    results_dir = ensure_dir("Trans_Unet_results_FocalLoss")  # where metrics + CMs go
+    metrics_csv = os.path.join(results_dir, "Trans_Unet_metrics_FocalLoss.csv")
+    save_root   = "qualitative_Trans_Unet_FocalLoss"         # where images go
 
     best_mdice = 0.0
     patience, bad = 20, 0
