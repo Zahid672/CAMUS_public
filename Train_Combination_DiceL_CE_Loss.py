@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # --- your modules ---
-from dataset import CAMUS_loader
+from preprocess_dataset import CAMUSPreprocessor  # your dataset loader
+# from Unet import UNet  # UNet model (if you want to compare)
 from Trans_Unet import TransUNetLite  # TransUNet model
 
 # ======================= Config =======================
@@ -26,9 +27,9 @@ GAMMA       = 0.1
 SAVE_N      = 8          # number of qualitative samples per epoch
 DEVICE      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-RESULTS_DIR = "TransUNet_results_DoubleLoss_Dice_CE"
-METRICS_CSV = os.path.join(RESULTS_DIR, "TransUNet_metrics_DoubleLoss_Dice_CE.csv")
-SAVE_ROOT   = "qualitative_TransUNet_DoubleLoss_Dice_CE"
+RESULTS_DIR = "TransUNet_Preprocessed_Data_results_DoubleLoss_Dice_CE"
+METRICS_CSV = os.path.join(RESULTS_DIR, "TransUNet_preprocessed_metrics_DoubleLoss_Dice_CE.csv")
+SAVE_ROOT   = "qualitative_Preprocessed_TransUNet_DoubleLoss_Dice_CE"
 
 DATA_DIR    = 'database_nifti'
 SPLIT_DIR   = 'prepared_data'
@@ -241,8 +242,8 @@ def main():
     # train_ds = CAMUS_loader(DATA_DIR, TRAIN_LIST, view=VIEW, img_size=IMG_SIZE, in_channels=IN_CHANNELS)
     # test_ds  = CAMUS_loader(DATA_DIR, TEST_LIST,  view=VIEW, img_size=IMG_SIZE, in_channels=IN_CHANNELS)
     # Otherwise we resize inside the loop (see resize_batch_to).
-    train_ds = CAMUS_loader(DATA_DIR, TRAIN_LIST, view=VIEW)
-    test_ds  = CAMUS_loader(DATA_DIR, TEST_LIST,  view=VIEW)
+    train_ds = CAMUSPreprocessor(DATA_DIR, TRAIN_LIST, view=VIEW)
+    test_ds  = CAMUSPreprocessor(DATA_DIR, TEST_LIST,  view=VIEW)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=4, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
