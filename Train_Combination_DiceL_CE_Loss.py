@@ -1,42 +1,49 @@
+# train_unet_dice_ce_pipeline.py
 import os
 import csv
+import time
 import numpy as np
 from PIL import Image
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 
 # --- your modules ---
-from preprocess_dataset import CAMUSPreprocessor  # your dataset loader
-# from Unet import UNet  # UNet model (if you want to compare)
-from Trans_Unet import TransUNetLite  # TransUNet model
+from preprocess_dataset import CAMUSPreprocessor  # builds splits and writes .npz files
+# from Unet import UNet 
+from Attention_Unet import UNet                            # your UNet (1 in-channel -> 4 classes)
 
 # ======================= Config =======================
 NUM_CLASSES = 4
-IN_CHANNELS = 1
-IMG_SIZE    = 256        # MUST be divisible by the internal patch size (usually 16). 256 -> bottleneck 16x16
-VIEW        = '2CH'      # or '4CH'
-BATCH_SIZE  = 2          # TransUNet is heavy; reduce if OOM
+IN_CHANNELS = 1             # your UNet expects 1-channel input
+IMG_SIZE    = 256
+VIEW        = '2CH'         # or '4CH'
+BATCH_SIZE  = 8
 EPOCHS      = 60
 LR          = 1e-4
 WEIGHT_DECAY= 1e-4
 STEP_SIZE   = 10
 GAMMA       = 0.1
-SAVE_N      = 8          # number of qualitative samples per epoch
+SAVE_N      = 8
+NUM_WORKERS = 4
+SEED        = 42
 DEVICE      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-RESULTS_DIR = "TransUNet_Preprocessed_Data_results_DoubleLoss_Dice_CE"
-METRICS_CSV = os.path.join(RESULTS_DIR, "TransUNet_preprocessed_metrics_DoubleLoss_Dice_CE.csv")
-SAVE_ROOT   = "qualitative_Preprocessed_TransUNet_DoubleLoss_Dice_CE"
-
+# Paths produced by your preprocessor
 DATA_DIR    = 'database_nifti'
 SPLIT_DIR   = 'prepared_data'
-TRAIN_LIST  = os.path.join(SPLIT_DIR, 'train_samples.npy')
-TEST_LIST   = os.path.join(SPLIT_DIR, 'test_ED.npy')   # or test_ES.npy
+PREPROC_DIR = 'preprocessed'   # where .npz will be stored
+TRAIN_SPLIT = 'train'
+VAL_SPLIT   = 'test_ED'        # or 'test_ES'
 
-# ===== Visualization palette (edit colors if you like) =====
+# Outputs
+RESULTS_DIR = "Attention_UNet_Preprocessed_Data_results_DoubleLoss_Dice_CE"
+METRICS_CSV = os.path.join(RESULTS_DIR, "Attention_UNet_preprocessed_metrics_DoubleLoss_Dice_CE.csv")
+SAVE_ROOT   = "qualitative_Preprocessed_Attention_UNet_DoubleLoss_Dice_CE"
+
+# ===== Visualization palette =====
 PALETTE = {
     0: (0, 0, 0),       # background
     1: (255, 0, 0),     # LV endocardium
@@ -45,6 +52,13 @@ PALETTE = {
 }
 
 # ======================= Utils =======================
+def set_seed(seed=42):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
 def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
     return p
@@ -53,7 +67,7 @@ def tensor_to_uint8_image(img_t):
     """img_t: [C,H,W] -> uint8 RGB [H,W,3]"""
     img = img_t.detach().cpu()
     if img.dim() != 3:
-        raise ValueError(f"Expected 3D tensor [C,H,W], got {img.shape}")
+        raise ValueError(f"Expected [C,H,W], got {img.shape}")
     if img.size(0) == 1:
         img = img.repeat(3, 1, 1)
     img = img.numpy().transpose(1, 2, 0)
@@ -63,8 +77,7 @@ def tensor_to_uint8_image(img_t):
     else:
         if mn < 0.0 or mx > 1.0:
             img = (img - mn) / (mx - mn + 1e-8)
-    img = (img * 255.0).clip(0, 255).astype(np.uint8)
-    return img
+    return (img * 255.0).clip(0, 255).astype(np.uint8)
 
 def mask_to_color(mask_hw, palette=PALETTE):
     """mask_hw: [H,W] int -> color RGB [H,W,3] uint8"""
@@ -75,7 +88,7 @@ def mask_to_color(mask_hw, palette=PALETTE):
         color[mask == c] = rgb
     return color
 
-def overlay_image(base_rgb, mask_rgb, alpha=0.5):
+def overlay_image(base_rgb, mask_rgb, alpha=0.45):
     base = base_rgb.astype(np.float32)
     mask = mask_rgb.astype(np.float32)
     out = (1 - alpha) * base + alpha * mask
@@ -89,8 +102,7 @@ def save_visuals(img_t, pred_hw, gt_hw, out_dir, name, alpha=0.45):
     Image.fromarray(pred_rgb).save(os.path.join(out_dir, f"{name}_pred.png"))
     Image.fromarray(gt_rgb).save(os.path.join(out_dir, f"{name}_gt.png"))
     Image.fromarray(img_rgb).save(os.path.join(out_dir, f"{name}_img.png"))
-    over_pred = overlay_image(img_rgb, pred_rgb, alpha=alpha)
-    Image.fromarray(over_pred).save(os.path.join(out_dir, f"{name}_overlay_pred.png"))
+    Image.fromarray(overlay_image(img_rgb, pred_rgb, alpha)).save(os.path.join(out_dir, f"{name}_overlay_pred.png"))
 
 def save_confusion_matrix(cm, out_path):
     np.savetxt(out_path, np.asarray(cm.cpu(), dtype=np.int64), fmt='%d', delimiter=',')
@@ -102,11 +114,45 @@ def log_metrics_csv(csv_path, epoch, tr_loss, te_loss, mDice, mIoU, dice_list, i
     row = [epoch, f"{tr_loss:.6f}", f"{te_loss:.6f}", f"{mDice:.6f}", f"{mIoU:.6f}", f"{lr:.8f}"] + \
           [f"{d:.6f}" for d in dice_list] + [f"{i:.6f}" for i in iou_list]
     write_header = not os.path.exists(csv_path)
+    ensure_dir(os.path.dirname(csv_path))
     with open(csv_path, "a", newline="") as f:
         w = csv.writer(f)
         if write_header:
             w.writerow(header)
         w.writerow(row)
+
+# ======================= Dataset (reads .npz) =======================
+class CAMUSNPZDataset(Dataset):
+    """
+    Expects folders created by CAMUSPreprocessor:
+        preprocessed/train/*.npz
+        preprocessed/test_ED/*.npz
+        preprocessed/test_ES/*.npz
+    Each .npz contains:
+        image [H,W] float32 in [0,1], mask [H,W] uint8, meta [patient, instant]
+    """
+    def __init__(self, root_dir, split, in_channels=1):
+        super().__init__()
+        self.dir = os.path.join(root_dir, split)
+        if not os.path.isdir(self.dir):
+            raise FileNotFoundError(f"Split directory not found: {self.dir}")
+        self.files = sorted([os.path.join(self.dir, f) for f in os.listdir(self.dir) if f.endswith(".npz")])
+        if not self.files:
+            raise RuntimeError(f"No .npz files found in {self.dir}")
+        self.in_channels = int(in_channels)
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        arr = np.load(self.files[idx], allow_pickle=True)
+        img = arr["image"]  # [H,W] float32
+        msk = arr["mask"]   # [H,W] uint8
+        img_t = torch.from_numpy(img).float().unsqueeze(0)  # [1,H,W]
+        if self.in_channels == 3:
+            img_t = img_t.repeat(3, 1, 1)
+        msk_t = torch.from_numpy(msk).long()                # [H,W]
+        return img_t, msk_t
 
 # ======================= Losses =======================
 def one_hot(target, num_classes, ignore_index=None):
@@ -125,10 +171,11 @@ def one_hot(target, num_classes, ignore_index=None):
 class SoftDiceLoss(nn.Module):
     def __init__(self, smooth=1.0, ignore_index=None, class_weights=None):
         super().__init__()
-        self.smooth = smooth
+        self.smooth = float(smooth)
         self.ignore_index = ignore_index
         self.class_weights = class_weights
     def forward(self, pred, target):
+        # pred: logits [B,C,H,W], target: [B,H,W]
         C = pred.shape[1]
         prob = F.softmax(pred, dim=1)
         tgt  = one_hot(target, C, self.ignore_index)
@@ -159,19 +206,22 @@ class DiceCELoss(nn.Module):
             lce = F.cross_entropy(pred, target, weight=weight, ignore_index=self.ignore_index)
         return self.dice_w * ld + self.ce_w * lce
 
-# ================== Size Guards (no dataset edit needed) ==================
+# ================== Size Guards & Alignment ==================
 def resize_batch_to(imgs, masks, size_hw):
     """Force images & masks to (H,W)=size_hw inside the training loop."""
     Ht, Wt = size_hw
-    # images: [B,C,H,W] float
     if imgs.shape[-2:] != (Ht, Wt):
         imgs = F.interpolate(imgs, size=(Ht, Wt), mode='bilinear', align_corners=False)
-    # masks: [B,H,W] long -> resize via nearest on a channel
     if masks.shape[-2:] != (Ht, Wt):
         masks_f = masks.unsqueeze(1).float()
         masks_r = F.interpolate(masks_f, size=(Ht, Wt), mode='nearest')
         masks   = masks_r.squeeze(1).long()
     return imgs, masks
+
+def align_logits_to_masks(logits, masks):
+    if logits.shape[-2:] != masks.shape[-2:]:
+        logits = F.interpolate(logits, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+    return logits
 
 # ======================= Train / Eval =======================
 def train_one_epoch(model, loader, optimizer, criterion, device, img_size):
@@ -182,11 +232,12 @@ def train_one_epoch(model, loader, optimizer, criterion, device, img_size):
         imgs, masks = resize_batch_to(imgs, masks, (img_size, img_size))
         optimizer.zero_grad()
         logits = model(imgs)                   # [B,C,H,W]
+        logits = align_logits_to_masks(logits, masks)
         loss = criterion(logits, masks)
         loss.backward()
         optimizer.step()
         running_loss += loss.item()
-    return running_loss / len(loader)
+    return running_loss / max(1, len(loader))
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device, num_classes, save_dir=None, epoch=None, save_n=8, img_size=IMG_SIZE):
@@ -203,6 +254,7 @@ def evaluate(model, loader, criterion, device, num_classes, save_dir=None, epoch
         imgs, masks = imgs.to(device), masks.to(device)
         imgs, masks = resize_batch_to(imgs, masks, (img_size, img_size))
         logits = model(imgs)
+        logits = align_logits_to_masks(logits, masks)
         loss = criterion(logits, masks)
         running_loss += loss.item()
 
@@ -230,34 +282,48 @@ def evaluate(model, loader, criterion, device, num_classes, save_dir=None, epoch
     mDice = float(cm.new_tensor(per_class_dice).mean().item())
     per_class_iou  = ((tp + eps) / (tp + fp + fn + eps)).tolist()
     mIoU = float(cm.new_tensor(per_class_iou).mean().item())
-    return running_loss / len(loader), per_class_dice, mDice, per_class_iou, mIoU, cm
+    return running_loss / max(1, len(loader)), per_class_dice, mDice, per_class_iou, mIoU, cm
 
 # ======================= Main =======================
 def main():
-    device = DEVICE
+    set_seed(SEED)
     ensure_dir(RESULTS_DIR)
 
-    # --- dataset & loaders ---
-    # If your CAMUS_loader supports img_size/in_channels, you can pass them here:
-    # train_ds = CAMUS_loader(DATA_DIR, TRAIN_LIST, view=VIEW, img_size=IMG_SIZE, in_channels=IN_CHANNELS)
-    # test_ds  = CAMUS_loader(DATA_DIR, TEST_LIST,  view=VIEW, img_size=IMG_SIZE, in_channels=IN_CHANNELS)
-    # Otherwise we resize inside the loop (see resize_batch_to).
-    train_ds = CAMUSPreprocessor(DATA_DIR, TRAIN_LIST, view=VIEW)
-    test_ds  = CAMUSPreprocessor(DATA_DIR, TEST_LIST,  view=VIEW)
+    # --------- Build splits + preprocess to .npz (idempotent) ----------
+    pp = CAMUSPreprocessor(
+        data_dir=DATA_DIR,
+        split_dir=SPLIT_DIR,
+        out_dir=PREPROC_DIR,
+        view=VIEW,
+        img_size=IMG_SIZE,
+        do_clahe=True,
+        denoise="median",
+        overwrite=False,
+        seed=1234,
+    )
+    pp.build_splits_if_missing()
+    # Only preprocess if missing or empty
+    need_pre = (not os.path.isdir(os.path.join(PREPROC_DIR, TRAIN_SPLIT))) or \
+               (len([f for f in os.listdir(os.path.join(PREPROC_DIR, TRAIN_SPLIT))]) == 0)
+    if need_pre:
+        pp.preprocess_all()
+    else:
+        print("Preprocessed .npz found. Skipping preprocessing.")
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=4, pin_memory=True)
-    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    # --------- Datasets & Loaders from .npz ----------
+    train_ds = CAMUSNPZDataset(PREPROC_DIR, TRAIN_SPLIT, in_channels=IN_CHANNELS)
+    val_ds   = CAMUSNPZDataset(PREPROC_DIR, VAL_SPLIT,   in_channels=IN_CHANNELS)
 
-    # --- model (TransUNet only) ---
-    # If your constructor uses different arg names, adjust them here.
-    model = TransUNetLite(
-        in_channels=IN_CHANNELS,
-        num_classes=NUM_CLASSES,
-        img_size=IMG_SIZE
-    ).to(device)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=True)
 
-    # --- loss, optim, sched ---
-    class_weights = None
+    # --------- Model (UNet) ----------
+    model = UNet().to(DEVICE)  # your UNet uses fixed in/out (1 -> 4)
+
+    # --------- Loss, Optim, Sched ----------
+    class_weights = None  # e.g., torch.tensor([1.0, 2.0, 2.0, 1.5], device=DEVICE)
     criterion = DiceCELoss(dice_w=0.5, ce_w=0.5,
                            class_weights=class_weights,
                            ignore_index=None,
@@ -267,18 +333,19 @@ def main():
 
     best_mdice = 0.0
     patience, bad = 20, 0
+    t0 = time.time()
 
     for epoch in range(EPOCHS):
-        tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, IMG_SIZE)
+        tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, DEVICE, IMG_SIZE)
         curr_lr = optimizer.param_groups[0]['lr']
 
         te_loss, per_cls_dice, mDice, per_cls_iou, mIoU, cm = evaluate(
-            model, test_loader, criterion, device, NUM_CLASSES,
+            model, val_loader, criterion, DEVICE, NUM_CLASSES,
             save_dir=SAVE_ROOT, epoch=epoch+1, save_n=SAVE_N, img_size=IMG_SIZE
         )
 
         print(
-            f"[TransUNet] Epoch {epoch+1:03d} | "
+            f"[UNet] Epoch {epoch+1:03d} | "
             f"train {tr_loss:.4f} | val {te_loss:.4f} | "
             f"mDice {mDice:.4f} | mIoU {mIoU:.4f} | "
             f"Dice {['%.3f'%d for d in per_cls_dice]} | "
@@ -297,13 +364,14 @@ def main():
         if mDice > best_mdice:
             best_mdice = mDice
             bad = 0
-            torch.save(model.state_dict(), f"best_transunet_dicece_mdice_{best_mdice:.4f}.pt")
+            torch.save(model.state_dict(), f"best_unet_dicece_mdice_{best_mdice:.4f}.pt")
         else:
             bad += 1
             if bad >= patience:
                 print("Early stopping.")
                 break
 
+    dt = time.time() - t0
     print(f"\n✅ Metrics logged to: {METRICS_CSV}")
     print(f"   Confusion matrices: {RESULTS_DIR}/confusion_matrix_epoch_XXX.csv")
 
