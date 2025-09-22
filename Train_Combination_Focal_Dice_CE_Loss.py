@@ -11,16 +11,17 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 # --- your modules ---
-from preprocess_dataset import CAMUSPreprocessor  # builds splits and writes .npz files if missing
-# from Unet import UNet
-from Attention_Unet import UNet                   # your UNet (1 in-channel -> 4 classes)
+from dataset import CAMUS_loader  # reads .npz files written by CAMUSPreprocessor
+# from preprocess_dataset import CAMUSPreprocessor  # builds splits and writes .npz files if missing
+from Unet import UNet
+# from Attention_Unet import UNet                   # your UNet (1 in-channel -> 4 classes)
 
 # ======================= Config =======================
 NUM_CLASSES = 4
 IN_CHANNELS = 1             # Attention_Unet expects 1-channel input
 IMG_SIZE    = 256
 VIEW        = '2CH'         # or '4CH'
-BATCH_SIZE  = 8
+BATCH_SIZE  = 32
 EPOCHS      = 60
 LR          = 1e-4
 WEIGHT_DECAY= 1e-4
@@ -39,9 +40,9 @@ TRAIN_SPLIT = 'train'
 VAL_SPLIT   = 'test_ED'        # or 'test_ES'
 
 # Outputs
-RESULTS_DIR = "Attention_UNet_Preprocessed_Data_results_Dice_CE_Focal"
-METRICS_CSV = os.path.join(RESULTS_DIR, "Attention_UNet_preprocessed_metrics_Dice_CE_Focal.csv")
-SAVE_ROOT   = "qualitative_Preprocessed_Attention_UNet_Dice_CE_Focal"
+RESULTS_DIR = "UNet_Raw_Data_results_Dice_CE_Focal"
+METRICS_CSV = os.path.join(RESULTS_DIR, "UNet_raw_metrics_Dice_CE_Focal.csv")
+SAVE_ROOT   = "qualitative_Raw_UNet_Dice_CE_Focal"
 
 # ===== Visualization palette =====
 PALETTE = {
@@ -369,7 +370,7 @@ def main():
     ensure_dir(RESULTS_DIR)
 
     # --------- Build splits + preprocess to .npz (idempotent) ----------
-    pp = CAMUSPreprocessor(
+    pp = CAMUS_loader(
         data_dir=DATA_DIR,
         split_dir=SPLIT_DIR,
         out_dir=PREPROC_DIR,
