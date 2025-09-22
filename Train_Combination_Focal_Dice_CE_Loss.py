@@ -12,7 +12,9 @@ from torch.utils.data import DataLoader
 
 # --- your modules ---
 from dataset import CAMUS_loader          # loads directly from NIfTI using patient lists
-from Unet import UNet                     # your UNet (1 in-channel -> 4 classes)
+# from Unet import UNet  
+from Attention_Unet import UNet                            # your UNet (1 in-channel -> 4 classes)
+# from Trans_Unet import UNet                   # your UNet (1 in-channel -> 4 classes)
 
 # ======================= Config =======================
 NUM_CLASSES = 4
@@ -36,9 +38,9 @@ TRAIN_LIST  = os.path.join(SPLIT_DIR, 'train_samples.npy')
 VAL_LIST    = os.path.join(SPLIT_DIR, 'test_ED.npy')   # or 'test_ES.npy'
 
 # Outputs
-RESULTS_DIR = "UNet_Raw_Data_results_Dice_CE_Focal"
-METRICS_CSV = os.path.join(RESULTS_DIR, "UNet_raw_metrics_Dice_CE_Focal.csv")
-SAVE_ROOT   = "qualitative_Raw_UNet_Dice_CE_Focal"
+RESULTS_DIR = "Attention_UNet_Raw_Data_results_Dice_CE_Focal"
+METRICS_CSV = os.path.join(RESULTS_DIR, "Attention_UNet_raw_metrics_Dice_CE_Focal.csv")
+SAVE_ROOT   = "qualitative_Raw_Attention_UNet_Dice_CE_Focal"
 
 # ===== Visualization palette =====
 PALETTE = {
