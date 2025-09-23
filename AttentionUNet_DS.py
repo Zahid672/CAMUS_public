@@ -4,12 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-
 # -------------------- Core Blocks --------------------
 class ResidualDoubleConv(nn.Module):
-    """
-    Two 3x3 convs with GroupNorm + ReLU and a residual path.
-    """
+    """Two 3x3 convs with GroupNorm + ReLU and a residual path."""
     def __init__(self, in_ch, out_ch, groups=8):
         super().__init__()
         self.project = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1, bias=False)
@@ -27,9 +24,7 @@ class ResidualDoubleConv(nn.Module):
 
 
 class SE(nn.Module):
-    """
-    Squeeze-and-Excitation channel recalibration.
-    """
+    """Squeeze-and-Excitation channel recalibration."""
     def __init__(self, ch, r=16):
         super().__init__()
         mid = max(1, ch // r)
@@ -77,7 +72,7 @@ class AttentionGate(nn.Module):
 class UpBlock(nn.Module):
     """
     Bilinear upsample + 3x3 conv (with GN) -> concat skip -> residual double conv.
-    Avoids checkerboard artifacts from transposed convs.
+    We expose .up and .conv so the caller can run attention between them.
     """
     def __init__(self, in_ch, skip_ch, out_ch, groups=8):
         super().__init__()
@@ -89,13 +84,6 @@ class UpBlock(nn.Module):
         )
         self.conv = ResidualDoubleConv(out_ch + skip_ch, out_ch, groups=groups)
 
-    def forward(self, x, skip):
-        x = self.up(x)
-        if x.shape[-2:] != skip.shape[-2:]:
-            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
-        x = torch.cat([x, skip], dim=1)
-        return self.conv(x)
-
 
 # -------------------- Attention U-Net (Deep Supervision Optional) --------------------
 class AttentionUNetDS(nn.Module):
@@ -106,15 +94,6 @@ class AttentionUNetDS(nn.Module):
       - Bilinear upsample path
       - SE-enhanced Attention Gates on all skips
       - Optional deep supervision (two aux heads at ~1/2 and ~1/4 scales)
-
-    Args:
-        in_channels:   input channels (1 for CAMUS)
-        num_classes:   number of output classes (4 for CAMUS)
-        base_ch:       base channel width (64 default)
-        depth:         encoder depth (5 recommended for 256x256)
-        groups:        GroupNorm groups
-        use_deep_supervision: if True, returns (main, aux1, aux2)
-        use_dilated_bottleneck: if True, uses dilation=2 in bottleneck
     """
     def __init__(
         self,
@@ -162,7 +141,9 @@ class AttentionUNetDS(nn.Module):
         for i in range(depth - 2, -1, -1):
             skip_ch = enc_chs[i]
             out_ch  = skip_ch
+            # up: dec_in -> out_ch
             self.up.append(UpBlock(dec_in, skip_ch, out_ch, groups=groups))
+            # AG now expects F_g == out_ch (post-up), F_l == skip_ch
             self.att.append(AttentionGate(F_g=out_ch, F_l=skip_ch, F_int=max(skip_ch // 2, 1), groups=groups))
             dec_in = out_ch
 
@@ -171,7 +152,6 @@ class AttentionUNetDS(nn.Module):
 
         self.use_deep_supervision = use_deep_supervision
         if use_deep_supervision and depth >= 5:
-            # Collect features after two decoder stages for aux heads
             self.aux1 = nn.Conv2d(enc_chs[1], num_classes, kernel_size=1)  # ~1/2 scale
             self.aux2 = nn.Conv2d(enc_chs[2], num_classes, kernel_size=1)  # ~1/4 scale
         else:
@@ -190,28 +170,34 @@ class AttentionUNetDS(nn.Module):
         # ----- Bottleneck -----
         h = self.bottleneck(h)
 
-        # ----- Decoder with Attention on all skips -----
-        aux_feats = []  # keep two decoder features for deep supervision
-        for i, (up, ag) in enumerate(zip(self.up, self.att)):
-            skip = feats[-(i + 2)]
-            gated = ag(skip, h)
-            h = up(h, gated)
+        # ----- Decoder with correct AG gating order -----
+        aux_feats = []
+        for i in range(len(self.up)):
+            skip = feats[-(i + 2)]         # pick corresponding encoder skip
 
-            # Save mid decoder features (~1/4 and ~1/2 scale) if available
-            # when depth=5: decoder stages = 4; indices i=1 (~1/4), i=2 (~1/2)
+            # 1) upsample+conv first to get the gate feature with expected channels
+            h_up = self.up[i].up(h)        # channels == out_ch for this stage
+
+            # 2) gate the skip using h_up (not the pre-up h)
+            skip_gated = self.att[i](skip, h_up)
+
+            # 3) concat and finish stage conv
+            if h_up.shape[-2:] != skip_gated.shape[-2:]:
+                h_up = F.interpolate(h_up, size=skip_gated.shape[-2:], mode='bilinear', align_corners=False)
+            h = self.up[i].conv(torch.cat([h_up, skip_gated], dim=1))
+
+            # collect deep supervision features (~1/4 and ~1/2) when depth=5
             if self.use_deep_supervision and self.aux1 is not None and self.aux2 is not None:
-                if i == 1:  # deeper (smaller)
-                    aux_feats.append(h)  # ~1/4
-                elif i == 2:
-                    aux_feats.append(h)  # ~1/2
+                if i == 1:      # ~1/4
+                    aux_feats.append(h)
+                elif i == 2:    # ~1/2
+                    aux_feats.append(h)
 
         logits = self.head(h)
 
         if self.use_deep_supervision and len(aux_feats) == 2:
-            # aux_feats[0] ~1/4, aux_feats[1] ~1/2 (by order above)
-            aux_small = self.aux2(aux_feats[0])
-            aux_big   = self.aux1(aux_feats[1])
-            # upsample to main size (training will weight them)
+            aux_small = self.aux2(aux_feats[0])  # ~1/4
+            aux_big   = self.aux1(aux_feats[1])  # ~1/2
             aux_small = F.interpolate(aux_small, size=logits.shape[-2:], mode='bilinear', align_corners=False)
             aux_big   = F.interpolate(aux_big,   size=logits.shape[-2:], mode='bilinear', align_corners=False)
             return logits, aux_big, aux_small

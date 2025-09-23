@@ -14,13 +14,15 @@ from torch.utils.data import DataLoader
 
 # --- your modules ---
 from dataset import CAMUS_loader
-from Modified_UNet import UNet
+# from Modified_UNet import UNet
+# from AttentionUNet_DS import AttentionUNetDS
+from Modified_UNet_deeper import UNet
 
 # ===================== Config =====================
 NUM_CLASSES = 4
 IMG_SIZE    = None            # None to keep dataset size; or set 224/256 to force-resize in-loop
 VIEW        = '2CH'           # or '4CH'
-BATCH_SIZE  = 16
+BATCH_SIZE  = 4
 EPOCHS      = 60
 LR          = 1e-4
 WEIGHT_DECAY= 1e-4
@@ -36,9 +38,9 @@ SPLIT_DIR   = 'prepared_data'
 TRAIN_LIST  = os.path.join(SPLIT_DIR, 'train_samples.npy')
 VAL_LIST    = os.path.join(SPLIT_DIR, 'test_ED.npy')  # or test_ES.npy
 
-RESULTS_DIR = "ModifiedUNet_results_CE_only"
+RESULTS_DIR = "Deeper_ModifiedUNet_results_CE_only"
 METRICS_CSV = os.path.join(RESULTS_DIR, "metrics_ce_only.csv")
-QUAL_DIR    = "qualitative_ModifiedUNet_CE"
+QUAL_DIR    = "Deeper_qualitative_ModifiedUNet_CE"
 
 PALETTE = {0:(0,0,0), 1:(255,0,0), 2:(0,255,0), 3:(0,0,255)}
 # ==================================================
@@ -208,15 +210,14 @@ def main():
 
     # Model (deep_supervision in your UNet is fine; we’ll ignore aux heads)
     model = UNet(
-        in_channels=1,
-        num_classes=NUM_CLASSES,
-        base_ch=64,
-        depth=5,
-        groups=8,
-        dropout=0.1,
-        deep_supervision=True,     # OK — we just ignore aux heads in loss
-        dilated_bottleneck=True
-    ).to(DEVICE)
+    in_channels=1,
+    num_classes=NUM_CLASSES,
+    base_ch=64,
+    depth=7,
+    groups=8,
+    deep_supervision=True,     # correct name
+    dilated_bottleneck=True
+).to(DEVICE)
 
     # Cross-Entropy ONLY
     class_weights = None   # e.g., torch.tensor([1.,2.,2.,1.], device=DEVICE)
