@@ -1,4 +1,4 @@
-# train_attention_unet_cbam_se_ce.py
+# train_attention_unet_cbam_se_dice.py
 import os
 import csv
 import time
@@ -38,9 +38,9 @@ SPLIT_DIR   = 'prepared_data'
 TRAIN_LIST  = os.path.join(SPLIT_DIR, 'train_samples.npy')
 VAL_LIST    = os.path.join(SPLIT_DIR, 'test_ED.npy')  # or test_ES.npy
 
-RESULTS_DIR = "AttUNet_CBAM_SE_results_CE"
-METRICS_CSV = os.path.join(RESULTS_DIR, "metrics_ce.csv")
-QUAL_DIR    = "qualitative_AttUNet_CBAM_SE_CE"
+RESULTS_DIR = "AttUNet_CBAM_SE_results_DICE"
+METRICS_CSV = os.path.join(RESULTS_DIR, "metrics_dice.csv")
+QUAL_DIR    = "qualitative_AttUNet_CBAM_SE_DICE"
 
 PALETTE = {0:(0,0,0), 1:(255,0,0), 2:(0,255,0), 3:(0,0,255)}
 # ==================================================
@@ -132,8 +132,43 @@ def main_logits_from(output: Union[torch.Tensor, Tuple[torch.Tensor, ...]]) -> t
         return output[0]
     return output
 
-# -------------- train / eval loops (CE only) --------------
-def train_one_epoch(model, loader, optimizer, criterion_ce, device, img_size):
+# -------------- Dice loss (multi-class, logits) --------------
+class SoftDiceLoss(nn.Module):
+    """
+    Multi-class soft Dice computed on logits.
+    Returns 1 - mean Dice over classes.
+    """
+    def __init__(self, smooth: float = 1.0, ignore_index: int = None):
+        super().__init__()
+        self.smooth = float(smooth)
+        self.ignore_index = ignore_index
+
+    def forward(self, logits: torch.Tensor, target_hw: torch.Tensor) -> torch.Tensor:
+        """
+        logits: [B,C,H,W]
+        target_hw: [B,H,W] with values in [0..C-1]
+        """
+        B, C, H, W = logits.shape
+        probs = F.softmax(logits, dim=1)                       # [B,C,H,W]
+        # one-hot target
+        tgt = torch.zeros((B, C, H, W), device=logits.device, dtype=probs.dtype)
+        tgt.scatter_(1, target_hw.unsqueeze(1), 1.0)           # [B,1,H,W] -> [B,C,H,W]
+
+        if self.ignore_index is not None:
+            valid = (target_hw != self.ignore_index).float()   # [B,H,W]
+            valid = valid.unsqueeze(1)                         # [B,1,H,W]
+            probs = probs * valid
+            tgt   = tgt * valid
+
+        dims = (0, 2, 3)
+        inter = torch.sum(probs * tgt, dims)                   # [C]
+        card  = torch.sum(probs + tgt, dims)                   # [C]
+        dice_c = (2. * inter + self.smooth) / (card + self.smooth)
+        loss = 1.0 - dice_c.mean()
+        return loss
+
+# -------------- train / eval loops (Dice only) --------------
+def train_one_epoch(model, loader, optimizer, dice_loss, device, img_size):
     model.train()
     running = 0.0
     for imgs, masks in loader:
@@ -143,7 +178,7 @@ def train_one_epoch(model, loader, optimizer, criterion_ce, device, img_size):
         logits = main_logits_from(model(imgs))
         if logits.shape[-2:] != masks.shape[-2:]:
             logits = F.interpolate(logits, size=masks.shape[-2:], mode='bilinear', align_corners=False)
-        loss = criterion_ce(logits, masks)
+        loss = dice_loss(logits, masks)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -151,7 +186,7 @@ def train_one_epoch(model, loader, optimizer, criterion_ce, device, img_size):
     return running / max(1, len(loader))
 
 @torch.no_grad()
-def evaluate(model, loader, criterion_ce, device, num_classes, img_size,
+def evaluate(model, loader, dice_loss, device, num_classes, img_size,
              save_dir=None, epoch=None, save_n=8):
     model.eval()
     running = 0.0
@@ -167,7 +202,7 @@ def evaluate(model, loader, criterion_ce, device, num_classes, img_size,
         logits = main_logits_from(model(imgs))
         if logits.shape[-2:] != masks.shape[-2:]:
             logits = F.interpolate(logits, size=masks.shape[-2:], mode='bilinear', align_corners=False)
-        loss = criterion_ce(logits, masks)
+        loss = dice_loss(logits, masks)
         running += loss.item()
 
         preds = torch.argmax(logits, dim=1)
@@ -218,9 +253,8 @@ def main():
         se_reduction=16
     ).to(DEVICE)
 
-    # -------- Loss: Cross-Entropy ONLY --------
-    class_weights = None   # or torch.tensor([...], device=DEVICE)
-    criterion_ce = nn.CrossEntropyLoss(weight=class_weights)
+    # -------- Loss: Dice ONLY --------
+    dice_loss = SoftDiceLoss(smooth=1.0, ignore_index=None)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=STEP_SIZE, gamma=GAMMA)
@@ -230,16 +264,16 @@ def main():
     t0 = time.time()
 
     for epoch in range(EPOCHS):
-        tr_loss = train_one_epoch(model, train_loader, optimizer, criterion_ce, DEVICE, IMG_SIZE)
+        tr_loss = train_one_epoch(model, train_loader, optimizer, dice_loss, DEVICE, IMG_SIZE)
         curr_lr = optimizer.param_groups[0]['lr']
 
         te_loss, per_cls_dice, mDice, per_cls_iou, mIoU, cm = evaluate(
-            model, val_loader, criterion_ce, DEVICE, NUM_CLASSES, IMG_SIZE,
+            model, val_loader, dice_loss, DEVICE, NUM_CLASSES, IMG_SIZE,
             save_dir=QUAL_DIR, epoch=epoch+1, save_n=SAVE_N
         )
 
         print(
-            f"[AttUNet-CBAM-SE + CE] Epoch {epoch+1:03d} | "
+            f"[AttUNet-CBAM-SE + Dice] Epoch {epoch+1:03d} | "
             f"train {tr_loss:.4f} | val {te_loss:.4f} | "
             f"mDice {mDice:.4f} | mIoU {mIoU:.4f} | "
             f"Dice {['%.3f'%d for d in per_cls_dice]} | "
@@ -257,7 +291,7 @@ def main():
 
         if mDice > best_mdice:
             best_mdice = mDice; bad = 0
-            torch.save(model.state_dict(), f"best_attunet_cbam_se_ce_mdice_{best_mdice:.4f}.pt")
+            torch.save(model.state_dict(), f"best_attunet_cbam_se_dice_mdice_{best_mdice:.4f}.pt")
         else:
             bad += 1
             if bad >= patience:
